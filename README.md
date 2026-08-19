@@ -139,3 +139,49 @@ See `.env.example`.
 | `MAX_RETRIES` | `3` | attempts per chunk, on 429/503/timeout |
 | `MAX_UPLOAD_BYTES` | `104857600` | 100 MB |
 | `GEMINI_USE_VERTEX` | `false` | route via Vertex AI instead of the Developer API; needs `GOOGLE_CLOUD_PROJECT` |
+
+## Design decisions
+
+**Normalize with ffmpeg at the front door.** Input can be WAV or MP3, any
+sample rate, mono or stereo. Instead of teaching the VAD, the chunker and the
+Gemini request to each handle all of that, everything past the entry point
+sees one format: 16 kHz mono PCM. Silero needs 16 kHz and Gemini downsamples
+to it anyway, so sending anything richer is wasted upload. It also means one
+decoder in the whole system, and the tool that reads the bytes is the same one
+that decides whether we can read them at all.
+
+**Cut at silence, not at the clock.** 120 seconds is what the model handles
+well in one request, but cutting exactly at 120.000s lands mid-word about half
+the time, and that word gets mangled in both chunks. So the target is a
+suggestion: the planner looks for the nearest silence within ±30s and cuts in
+the middle of it, which leaves the most room for error on both sides. Measured
+with a 60s target, cuts landed at 60.53s, 121.14s and 181.58s, always inside a
+detected silence. If there's no silence in the window at all (music, noise,
+unbroken speech) it hard-cuts at the target and marks the chunk.
+
+**No overlap.** Overlap is the usual fix for split words, but cutting at
+silence already solved that. What it costs is real: duplicate audio, duplicate
+tokens, and a de-duplication step that has to work out which copy of "and then
+he said" is the real one. That's fuzzy text matching over approximate
+timestamps, which fails quietly and corrupts transcripts. Since no word spans
+a boundary, chunks tile the timeline exactly instead
+(`chunk[i].start == chunk[i-1].end`).
+
+**Bound the parallelism.** Chunks are independent, so a long file is easy to
+parallelise. But sending all of them at once means ~60 simultaneous requests
+for a two hour file, a 429 on the whole batch, and 60 chunks of decoded audio
+in memory together. A semaphore caps what's in flight regardless of file
+length, so load depends on configuration and not on what someone uploaded.
+Retries use jitter for the same reason: a batch rate-limited together would
+otherwise all retry at the same instant.
+
+**Validate timestamps before stitching.** These times come from a model
+emitting numbers as tokens, not from a forced aligner, so they drift: ends
+before starts, times past the end of the clip, segments going backwards. And
+because each chunk's times get shifted by that chunk's offset, an unchecked
+error doesn't stay local. A segment that overruns its chunk lands on top of the
+next chunk's segments and the merged transcript reads out of order. So each
+chunk is clamped to `[0, duration]` and forced monotonic *before* the offset is
+added, which keeps every error inside its own chunk. The fixes are counted and
+returned in `metadata.timestamps_repaired` rather than applied silently, since
+200 repairs across 300 segments means something very different from zero.
